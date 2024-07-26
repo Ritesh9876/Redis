@@ -22,7 +22,7 @@
 #include "zset.h"
 #include "common.h"
 #include "list.h"
-
+#include "heap.h"
 
 
 using namespace std;
@@ -108,6 +108,8 @@ static struct {
     std::vector<Conn *> fd2conn;
     // timers for idle connections
     DList idle_list;
+    // timers for TTLs
+    std::vector<HeapItem> heap;
 } g_data;
 
 static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
@@ -207,6 +209,8 @@ struct Entry {
     std::string val;
     uint32_t type = 0;
     ZSet *zset = NULL;
+    // for TTLs
+    size_t heap_idx = -1;
 };
 
 static bool entry_eq(HNode *lhs, HNode *rhs) {
@@ -372,11 +376,77 @@ static bool str2dbl(const std::string &s, double &out) {
     return endp == s.c_str() + s.size() && !isnan(out);
 }
 
+
+// set or remove the TTL
+static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
+    if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {
+        // erase an item from the heap
+        // by replacing it with the last item in the array.
+        size_t pos = ent->heap_idx;
+        g_data.heap[pos] = g_data.heap.back();
+        g_data.heap.pop_back();
+        if (pos < g_data.heap.size()) {
+            heap_update(g_data.heap.data(), pos, g_data.heap.size());
+        }
+        ent->heap_idx = -1;
+    } else if (ttl_ms >= 0) {
+        size_t pos = ent->heap_idx;
+        if (pos == (size_t)-1) {
+            // add an new item to the heap
+            HeapItem item;
+            item.ref = &ent->heap_idx;
+            g_data.heap.push_back(item);
+            pos = g_data.heap.size() - 1;
+        }
+        g_data.heap[pos].val = get_monotonic_usec() + (uint64_t)ttl_ms * 1000;
+        heap_update(g_data.heap.data(), pos, g_data.heap.size());
+    }
+}
+
 static bool str2int(const std::string &s, int64_t &out) {
     char *endp = NULL;
     out = strtoll(s.c_str(), &endp, 10);
     return endp == s.c_str() + s.size();
 }
+
+static void do_expire(std::vector<std::string> &cmd, std::string &out) {
+    int64_t ttl_ms = 0;
+    if (!str2int(cmd[2], ttl_ms)) {
+        return out_err(out, ERR_ARG, "expect int64");
+    }
+
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        Entry *ent = container_of(node, Entry, node);
+        entry_set_ttl(ent, ttl_ms);
+    }
+    return out_int(out, node ? 1: 0);
+}
+
+static void do_ttl(std::vector<std::string> &cmd, std::string &out) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        return out_int(out, -2);
+    }
+
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->heap_idx == (size_t)-1) {
+        return out_int(out, -1);
+    }
+
+    uint64_t expire_at = g_data.heap[ent->heap_idx].val;
+    uint64_t now_us = get_monotonic_usec();
+    return out_int(out, expire_at > now_us ? (expire_at - now_us) / 1000 : 0);
+}
+
 
 // zadd zset score name
 static void do_zadd(std::vector<std::string> &cmd, std::string &out) {
@@ -516,6 +586,10 @@ static void do_request(std::vector<std::string> &cmd, std::string &out) {
         do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
         do_del(cmd, out);
+    }  else if (cmd.size() == 3 && cmd_is(cmd[0], "pexpire")) {
+        do_expire(cmd, out);
+    } else if (cmd.size() == 2 && cmd_is(cmd[0], "pttl")) {
+        do_ttl(cmd, out);
     } else if (cmd.size() == 4 && cmd_is(cmd[0], "zadd")) {
         do_zadd(cmd, out);
     } else if (cmd.size() == 3 && cmd_is(cmd[0], "zrem")) {
