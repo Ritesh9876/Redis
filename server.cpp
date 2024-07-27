@@ -23,7 +23,7 @@
 #include "common.h"
 #include "list.h"
 #include "heap.h"
-
+#include "thread_pool.h"
 
 using namespace std;
 
@@ -110,6 +110,8 @@ static struct {
     DList idle_list;
     // timers for TTLs
     std::vector<HeapItem> heap;
+    // the thread pool
+    TheadPool tp;
 } g_data;
 
 static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
@@ -326,6 +328,39 @@ static void do_set(std::vector<std::string> &cmd, std::string &out) {
     return out_nil(out);
 }
 
+// deallocate the key immediately
+static void entry_destroy(Entry *ent) {
+    switch (ent->type) {
+    case T_ZSET:
+        zset_dispose(ent->zset);
+        delete ent->zset;
+        break;
+    }
+    delete ent;
+}
+
+static void entry_del_async(void *arg) {
+    entry_destroy((Entry *)arg);
+}
+
+static void entry_del(Entry *ent) {
+    entry_set_ttl(ent, -1);
+
+    const size_t k_large_container_size = 10000;
+    bool too_big = false;
+    switch (ent->type) {
+    case T_ZSET:
+        too_big = hm_size(&ent->zset->hmap) > k_large_container_size;
+        break;
+    }
+
+    if (too_big) {
+        thread_pool_queue(&g_data.tp, &entry_del_async, ent);
+    } else {
+        entry_destroy(ent);
+    }
+}
+
 static void do_del(std::vector<std::string> &cmd, std::string &out) {
     Entry key;
     key.key.swap(cmd[1]);
@@ -333,7 +368,8 @@ static void do_del(std::vector<std::string> &cmd, std::string &out) {
 
     HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
     if (node) {
-        delete container_of(node, Entry, node);
+        //delete container_of(node, Entry, node);
+        entry_del(container_of(node, Entry, node));
     }
     return out_int(out, node ? 1 : 0);
 }
@@ -799,6 +835,7 @@ static void process_timers() {
 int main()
 {
     dlist_init(&g_data.idle_list);
+    thread_pool_init(&g_data.tp, 4);
 
     /*
         int socket(int <family>, int <type>, int <protocol>);
